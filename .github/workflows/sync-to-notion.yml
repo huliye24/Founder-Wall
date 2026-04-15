@@ -1,0 +1,82 @@
+name: Sync to Notion
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+    inputs:
+      subdir:
+        description: '子目录（可选）'
+        required: false
+        default: ''
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Run sync
+        env:
+          NOTION_API_TOKEN: ${{ secrets.NOTION_API_TOKEN }}
+          NOTION_DATABASE_DEFAULT: ${{ secrets.NOTION_DATABASE_DEFAULT }}
+          NOTION_DATABASE_MEMORY: ${{ secrets.NOTION_DATABASE_MEMORY }}
+          NOTION_DATABASE_AGENTS: ${{ secrets.NOTION_DATABASE_AGENTS }}
+          NOTION_DATABASE_PROJECTS: ${{ secrets.NOTION_DATABASE_PROJECTS }}
+          NOTION_DATABASE_FLOWS: ${{ secrets.NOTION_DATABASE_FLOWS }}
+          NOTION_DATABASE_KNOWLEDGE: ${{ secrets.NOTION_DATABASE_KNOWLEDGE }}
+        run: |
+          if [ -n "${{ github.event.inputs.subdir }}" ]; then
+            python sync_to_notion.py --path . --subdir "${{ github.event.inputs.subdir }}"
+          else
+            python sync_to_notion.py --path .
+          fi
+      
+      - name: Commit changes (optional - for tracking sync status)
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add -A
+          git diff --staged --quiet || git commit -m "docs: update sync status [skip ci]"
+          git push
+
+  sync-draft:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Dry run sync
+        env:
+          NOTION_API_TOKEN: ${{ secrets.NOTION_API_TOKEN }}
+          NOTION_DATABASE_DEFAULT: ${{ secrets.NOTION_DATABASE_DEFAULT }}
+        run: |
+          python sync_to_notion.py --path . --dry-run
