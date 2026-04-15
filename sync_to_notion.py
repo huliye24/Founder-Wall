@@ -18,22 +18,34 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 
+# 加载 .env 文件
+from pathlib import Path
+env_file = Path(__file__).parent / ".env"
+if env_file.exists():
+    with open(env_file, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith('#') and '=' in line:
+                key, value = line.split('=', 1)
+                os.environ.setdefault(key.strip(), value.strip())
+
 # ============================================================
 # 配置区域 - 请根据实际情况修改
 # ============================================================
 
-# 文档类型映射到 Notion Database ID
+# 文档类型映射到 Notion Database ID（暂时都使用默认数据库）
+DEFAULT_DB = os.getenv("NOTION_DATABASE_DEFAULT", "")
 DATABASE_MAPPING = {
-    "memory": os.getenv("NOTION_DATABASE_MEMORY", ""),
-    "agents": os.getenv("NOTION_DATABASE_AGENTS", ""),
-    "projects": os.getenv("NOTION_DATABASE_PROJECTS", ""),
-    "flows": os.getenv("NOTION_DATABASE_FLOWS", ""),
-    "knowledge": os.getenv("NOTION_DATABASE_KNOWLEDGE", ""),
-    "default": os.getenv("NOTION_DATABASE_DEFAULT", ""),
+    "memory": DEFAULT_DB,
+    "agents": DEFAULT_DB,
+    "projects": DEFAULT_DB,
+    "flows": DEFAULT_DB,
+    "knowledge": DEFAULT_DB,
+    "default": DEFAULT_DB,
 }
 
-# 默认 Database ID（用于未分类文档）
-DEFAULT_DATABASE_ID = os.getenv("NOTION_DATABASE_DEFAULT", "")
+# 默认 Database ID
+DEFAULT_DATABASE_ID = DEFAULT_DB
 
 # ============================================================
 # 日志配置
@@ -233,7 +245,7 @@ class NotionClient:
     """Notion API 客户端"""
     
     API_URL = "https://api.notion.com/v1"
-    API_VERSION = "2022-06-30"
+    API_VERSION = "2026-03-11"
     
     def __init__(self, token: str):
         self.token = token
@@ -305,22 +317,47 @@ class NotionClient:
         }
         
         if children:
-            data["children"] = children
+            # 分块上传，每块最多100个
+            data["children"] = children[:100]
+            page = self._request("POST", "/pages", data)
+            
+            # 如果还有更多block，追加到页面
+            if len(children) > 100:
+                remaining = children[100:]
+                while remaining:
+                    chunk = remaining[:100]
+                    remaining = remaining[100:]
+                    block_data = {"children": chunk}
+                    page_id = page["id"]
+                    try:
+                        self._request("PATCH", f"/blocks/{page_id}/children", block_data)
+                    except Exception as e:
+                        logger.warning(f"追加blocks失败: {e}")
         
-        return self._request("POST", "/pages", data)
+        return page
     
     def update_page(self, page_id: str, properties: dict, children: List[dict] = None) -> dict:
         """更新页面"""
         data = {"properties": properties}
         
+        page = self._request("PATCH", f"/pages/{page_id}", data)
+        
         if children is not None:
             if children:
-                data["children"] = children
-            else:
-                # 清空子内容需要特殊处理
-                pass
+                # 分块上传
+                block_data = {"children": children[:100]}
+                try:
+                    self._request("PATCH", f"/blocks/{page_id}/children", block_data)
+                    if len(children) > 100:
+                        remaining = children[100:]
+                        while remaining:
+                            chunk = remaining[:100]
+                            remaining = remaining[100:]
+                            self._request("PATCH", f"/blocks/{page_id}/children", {"children": chunk})
+                except Exception as e:
+                    logger.warning(f"更新blocks失败: {e}")
         
-        return self._request("PATCH", f"/pages/{page_id}", data)
+        return page
     
     def archive_page(self, page_id: str) -> dict:
         """归档页面"""
@@ -395,11 +432,13 @@ class MarkdownToNotionConverter:
                 while i < len(lines) and not lines[i].strip().startswith('```'):
                     code_content.append(lines[i])
                     i += 1
+                # 限制每个代码块的长度
+                code_text = '\n'.join(code_content)[:1900]
                 blocks.append({
                     "object": "block",
                     "type": "code",
                     "code": {
-                        "rich_text": [{"type": "text", "text": {"content": '\n'.join(code_content)}}],
+                        "rich_text": [{"type": "text", "text": {"content": code_text}}],
                         "language": "markdown"
                     }
                 })
@@ -482,41 +521,53 @@ class MarkdownToNotionConverter:
         """创建 Notion 页面属性"""
         properties = {}
         
-        # 标题（大多数数据库都有 Title 属性）
-        properties["Name"] = {
+        # 标题
+        properties["名称"] = {
             "title": [{"text": {"content": doc.title[:200]}}]
         }
         
         # 类型
         if doc.doc_type != "default":
-            properties["Type"] = {"select": {"name": doc.doc_type}}
+            type_map = {
+                "memory": "记忆库",
+                "agents": "节点库", 
+                "projects": "项目系统",
+                "flows": "流程系统",
+                "knowledge": "知识库",
+            }
+            type_name = type_map.get(doc.doc_type, doc.doc_type)
+            properties["类型"] = {"select": {"name": type_name}}
         
         # 标签
         if doc.tags:
-            properties["Tags"] = {
+            properties["标签"] = {
                 "multi_select": [{"name": tag[:50]} for tag in doc.tags[:20]]
-            }
-        
-        # 重要性
-        if doc.importance:
-            # 转换为星星
-            stars = "★" * doc.importance + "☆" * (5 - doc.importance)
-            properties["Importance"] = {
-                "select": {"name": stars}
             }
         
         # 来源
         if doc.source:
-            properties["Source"] = {"select": {"name": doc.source}}
+            properties["来源"] = {"select": {"name": doc.source}}
         
-        # 状态
-        if doc.status:
-            properties["Status"] = {"select": {"name": doc.status}}
+        # 状态 - 跳过，因为数据库的status选项未知
+        # if doc.status:
+        #     properties["状态"] = {"status": {"name": doc.status}}
         
-        # 文件路径（用于追踪）
-        properties["File Path"] = {
+        # 文件路径
+        properties["文件路径"] = {
             "rich_text": [{"text": {"content": str(doc.file_path)}}]
         }
+        
+        # 重要性
+        if doc.importance:
+            importance_map = {
+                5: "MVP",
+                4: "重要",
+                3: "一般",
+                2: "普通",
+                1: "实验"
+            }
+            importance_name = importance_map.get(doc.importance, "一般")
+            properties["重要性"] = {"select": {"name": importance_name}}
         
         return properties
 
@@ -527,13 +578,14 @@ class MarkdownToNotionConverter:
 class SyncManager:
     """同步管理器"""
     
-    # 文档类型到数据库的映射
+    # 文档类型到数据库的映射（暂时都使用默认数据库）
     TYPE_TO_DATABASE = {
-        "memory": os.getenv("NOTION_DATABASE_MEMORY", ""),
-        "agents": os.getenv("NOTION_DATABASE_AGENTS", ""),
-        "projects": os.getenv("NOTION_DATABASE_PROJECTS", ""),
-        "flows": os.getenv("NOTION_DATABASE_FLOWS", ""),
-        "knowledge": os.getenv("NOTION_DATABASE_KNOWLEDGE", ""),
+        "memory": os.getenv("NOTION_DATABASE_DEFAULT", ""),
+        "agents": os.getenv("NOTION_DATABASE_DEFAULT", ""),
+        "projects": os.getenv("NOTION_DATABASE_DEFAULT", ""),
+        "flows": os.getenv("NOTION_DATABASE_DEFAULT", ""),
+        "knowledge": os.getenv("NOTION_DATABASE_DEFAULT", ""),
+        "default": os.getenv("NOTION_DATABASE_DEFAULT", ""),
     }
     
     def __init__(self, notion_token: str, root_path: str):
@@ -564,19 +616,13 @@ class SyncManager:
                 pages = self.notion.query_database(database_id)
                 for page in pages:
                     page_id = page['id']
-                    # 尝试从属性中获取文件路径
                     file_path = None
-                    if "File Path" in page.get("properties", {}):
-                        rich_text = page["properties"]["File Path"].get("rich_text", [])
+                    
+                    # 中文属性名
+                    if "文件路径" in page.get("properties", {}):
+                        rich_text = page["properties"]["文件路径"].get("rich_text", [])
                         if rich_text:
                             file_path = rich_text[0].get("plain_text", "")
-                    
-                    # 也尝试从标题中匹配
-                    if not file_path:
-                        title_parts = page["properties"].get("Name", {}).get("title", [])
-                        if title_parts:
-                            title = title_parts[0].get("plain_text", "")
-                            # 存储标题作为后备
                     
                     self.existing_pages[page_id] = {
                         "database_id": database_id,
@@ -682,35 +728,248 @@ def main():
     parser = argparse.ArgumentParser(description="AI联盟 Notion 同步工具")
     parser.add_argument("--token", help="Notion API Token")
     parser.add_argument("--path", default=".", help="要同步的目录路径")
-    parser.add_argument("--subdir", default="", help="子目录（如 AI创业者联盟/Notion系统）")
     parser.add_argument("--dry-run", action="store_true", help="仅测试不实际同步")
+    parser.add_argument("--download", action="store_true", help="从 Notion 下载到本地")
+    parser.add_argument("--bidirectional", action="store_true", help="双向同步")
     
     args = parser.parse_args()
     
-    # 从环境变量或参数获取 token
     notion_token = args.token or os.getenv("NOTION_API_TOKEN")
     
     if not notion_token:
-        logger.error("未设置 NOTION_API_TOKEN，请设置环境变量或传入 --token 参数")
+        logger.error("未设置 NOTION_API_TOKEN")
         return 1
+    
+    # 下载模式
+    if args.download:
+        manager = BidirectionalSyncManager(notion_token, args.path)
+        downloaded = manager.download_all()
+        logger.info(f"下载完成: {downloaded} 个页面")
+        return 0
     
     # 创建同步管理器
     manager = SyncManager(notion_token, args.path)
     
     if args.dry_run:
         logger.info("Dry run 模式，仅解析文件不实际同步")
-        # TODO: 实现 dry run 模式
+        return 0
+    
+    # 双向同步模式
+    if args.bidirectional:
+        logger.info("开始双向同步...")
+        bi_manager = BidirectionalSyncManager(notion_token, args.path)
+        downloaded = bi_manager.download_all()
+        logger.info(f"Notion -> 本地: {downloaded} 个页面")
+        success = bi_manager.sync_directory()
+        bi_manager.print_stats()
         return 0
     
     # 执行同步
-    if args.subdir:
-        success = manager.sync_directory(args.subdir)
-    else:
-        success = manager.sync_directory()
-    
+    success = manager.sync_directory()
     manager.print_stats()
     
     return 0 if manager.stats["errors"] == 0 else 1
+
+# ============================================================
+# 双向同步管理器
+# ============================================================
+
+import urllib.request
+
+class BidirectionalSyncManager:
+    """双向同步管理器"""
+    
+    TYPE_TO_DATABASE = {
+        "memory": os.getenv("NOTION_DATABASE_DEFAULT", ""),
+        "agents": os.getenv("NOTION_DATABASE_DEFAULT", ""),
+        "projects": os.getenv("NOTION_DATABASE_DEFAULT", ""),
+        "flows": os.getenv("NOTION_DATABASE_DEFAULT", ""),
+        "knowledge": os.getenv("NOTION_DATABASE_DEFAULT", ""),
+        "default": os.getenv("NOTION_DATABASE_DEFAULT", ""),
+    }
+    
+    def __init__(self, notion_token: str, root_path: str):
+        self.notion = NotionClient(notion_token)
+        self.parser = MarkdownParser()
+        self.converter = MarkdownToNotionConverter(self.notion)
+        self.root_path = Path(root_path)
+        self.stats = {"created": 0, "updated": 0, "skipped": 0, "errors": 0, "downloaded": 0}
+        self.existing_pages = {}
+        self._load_existing_pages()
+    
+    def _load_existing_pages(self):
+        logger.info("加载已存在的 Notion 页面...")
+        database_id = os.getenv("NOTION_DATABASE_DEFAULT", "")
+        if database_id:
+            try:
+                pages = self.notion.query_database(database_id)
+                for page in pages:
+                    file_path = None
+                    if "文件路径" in page.get("properties", {}):
+                        rich_text = page["properties"]["文件路径"].get("rich_text", [])
+                        if rich_text:
+                            file_path = rich_text[0].get("plain_text", "")
+                    self.existing_pages[page["id"]] = {"database_id": database_id, "file_path": file_path}
+                logger.info(f"  已加载 {len(pages)} 个页面")
+            except Exception as e:
+                logger.warning(f"  加载失败: {e}")
+    
+    def _get_database_id(self, doc_type: str = "default") -> str:
+        return os.getenv("NOTION_DATABASE_DEFAULT", "")
+    
+    def fetch_page_content(self, page_id: str) -> List[dict]:
+        try:
+            headers = {
+                "Authorization": f"Bearer {self.notion.token}",
+                "Content-Type": "application/json",
+                "Notion-Version": "2026-03-11"
+            }
+            url = f"https://api.notion.com/v1/blocks/{page_id}/children"
+            logger.info(f"Fetching: {url}")
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                result = json.loads(resp.read())
+                return result.get("results", [])
+        except Exception as e:
+            logger.error(f"获取页面内容失败 {page_id}: {e}")
+            return []
+    
+    def blocks_to_markdown(self, blocks: List[dict]) -> str:
+        md_lines = []
+        for block in blocks:
+            block_type = block.get("type", "")
+            content = block.get(block_type, {})
+            rich_text = content.get("rich_text", [])
+            text = "".join(rt.get("text", {}).get("content", "") for rt in rich_text if rt.get("type") == "text")
+            
+            if block_type == "heading_1": md_lines.append(f"# {text}")
+            elif block_type == "heading_2": md_lines.append(f"## {text}")
+            elif block_type == "heading_3": md_lines.append(f"### {text}")
+            elif block_type == "paragraph": md_lines.append(text)
+            elif block_type == "bulleted_list_item": md_lines.append(f"- {text}")
+            elif block_type == "numbered_list_item": md_lines.append(f"1. {text}")
+            elif block_type == "code":
+                md_lines.append(f"```{content.get('language', 'markdown')}")
+                md_lines.append(text)
+                md_lines.append("```")
+            elif block_type == "quote": md_lines.append(f"> {text}")
+            elif block_type == "divider": md_lines.append("---")
+            
+            if block.get("has_children"):
+                children = self.fetch_page_content(block["id"])
+                if children:
+                    md_lines.append(self.blocks_to_markdown(children))
+        return "\n".join(md_lines)
+    
+    def download_page(self, page: dict, output_dir: Path) -> Optional[Path]:
+        try:
+            props = page.get("properties", {})
+            name_list = props.get("名称", {}).get("title", [])
+            title = name_list[0].get("plain_text", "Untitled") if name_list else "Untitled"
+            
+            file_path_list = props.get("文件路径", {}).get("rich_text", [])
+            file_path_str = file_path_list[0].get("plain_text", "") if file_path_list else ""
+            
+            type_select = props.get("类型", {}).get("select", {})
+            doc_type = type_select.get("name", "default") if type_select else "default"
+            
+            if file_path_str:
+                output_path = Path(file_path_str)
+            else:
+                type_dir_map = {"记忆库": "Notion系统/01-Memory-记忆库", "节点库": "Notion系统/02-Agents-节点库",
+                    "项目系统": "Notion系统/03-Projects-项目系统", "流程系统": "Notion系统/04-Flows-流程系统",
+                    "知识库": "Notion系统/05-Knowledge-知识库"}
+                subdir = type_dir_map.get(doc_type, "Notion系统")
+                safe_title = re.sub(r'[<>:"/\\|?*]', '_', title)
+                output_path = output_dir / subdir / f"{safe_title}.md"
+            
+            blocks = self.fetch_page_content(page["id"])
+            content = self.blocks_to_markdown(blocks)
+            
+            frontmatter = f"""---
+title: {title}
+type: {doc_type}
+notion_id: {page["id"]}
+source: notion
+---
+
+"""
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write(frontmatter + content)
+            logger.info(f"下载: {title} -> {output_path}")
+            return output_path
+        except Exception as e:
+            logger.error(f"下载页面失败: {e}")
+            return None
+    
+    def download_all(self, output_dir: Path = None) -> int:
+        output_dir = output_dir or self.root_path / "AI创业者联盟"
+        logger.info(f"下载所有页面到: {output_dir}")
+        
+        downloaded = 0
+        database_id = self._get_database_id()
+        if database_id:
+            try:
+                pages = self.notion.query_database(database_id)
+                for page in pages:
+                    if self.download_page(page, output_dir):
+                        downloaded += 1
+            except Exception as e:
+                logger.warning(f"下载失败: {e}")
+        logger.info(f"下载完成: {downloaded} 个页面")
+        return downloaded
+    
+    def sync_file(self, file_path: Path) -> bool:
+        try:
+            doc = self.parser.parse(file_path)
+            database_id = self._get_database_id(doc.doc_type)
+            if not database_id:
+                self.stats["skipped"] += 1
+                return False
+            
+            existing_page_id = None
+            for page_id, info in self.existing_pages.items():
+                if info.get("file_path") == str(file_path):
+                    existing_page_id = page_id
+                    break
+            
+            blocks = self.converter.markdown_to_blocks(doc.content)
+            properties = self.converter.create_properties(doc, database_id)
+            
+            if existing_page_id:
+                logger.info(f"更新: {doc.title}")
+                self.notion.update_page(existing_page_id, properties, blocks)
+                self.stats["updated"] += 1
+            else:
+                logger.info(f"创建: {doc.title}")
+                self.notion.create_page(database_id, properties, blocks)
+                self.stats["created"] += 1
+            return True
+        except Exception as e:
+            logger.error(f"同步失败 {file_path}: {e}")
+            self.stats["errors"] += 1
+            return False
+    
+    def sync_directory(self) -> int:
+        md_files = list(self.root_path.glob("**/*.md"))
+        md_files = [f for f in md_files if f.name != "README.md" and "node_modules" not in str(f)]
+        logger.info(f"找到 {len(md_files)} 个 Markdown 文件")
+        
+        success_count = 0
+        for md_file in md_files:
+            if self.sync_file(md_file):
+                success_count += 1
+        return success_count
+    
+    def print_stats(self):
+        logger.info("=" * 50)
+        logger.info("同步完成!")
+        logger.info(f"  创建: {self.stats['created']}")
+        logger.info(f"  更新: {self.stats['updated']}")
+        logger.info(f"  跳过: {self.stats['skipped']}")
+        logger.info(f"  错误: {self.stats['errors']}")
+        logger.info("=" * 50)
 
 if __name__ == "__main__":
     exit(main())
